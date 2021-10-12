@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crossplane2argocd
+  namespace: crossplane-system
+  labels:
+    app: crossplane2argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crossplane2argocd
+  template:
+    metadata:
+      labels:
+        app: crossplane2argocd
+    spec:
+      containers:
+      - name: crossplane2argocd
+        image: rochaporto/crossplane2argocd:v0.2
+        command: ["/scripts/doit.sh"]
+        volumeMounts:
+        - name: gcp-credentials
+          mountPath: /creds/gcp
+          readOnly: true
+        - name: scripts
+          mountPath: /scripts
+      serviceAccountName: crossplane2argo
+      volumes:
+      - name: gcp-credentials
+        secret:
+          secretName: gcp-account-creds
+      - name: scripts
+        configMap:
+          name: crossplane2argocd
+          defaultMode: 0777
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crossplane2argo
+  namespace: crossplane-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: crossplane2argocd
+subjects:
+- kind: ServiceAccount
+  name: crossplane2argo
+  namespace: crossplane-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crossplane2argocd
+  namespace: crossplane-system
+data:
+  doit.sh: |
+    #!/bin/bash
+    
+    # login to gcloud using provided service account
+    gcloud auth activate-service-account --key-file /creds/gcp/credentials.json --project it-atlas-cern
+    
+    # login to argocd with the pass set to the server pod name
+    ARGOCDIP=$(kubectl -n argocd get service argocd-server --no-headers -o custom-columns=IP:.status.loadBalancer.ingress[0].ip)
+    argocd login --insecure $ARGOCDIP --username admin --password $(kubectl -n argocd get pod | grep argocd-server | awk '{print $1}')
+    
+    # infinite loop looking for new clusters
+    while true; do
+      # iterate through gke clusters created by crossplane.
+      # when not yet registered in argocd, do it.
+      for k in $(kubectl get gkecluster --no-headers -o custom-columns=NAME:.metadata.name); do
+        l=$(kubectl get gkecluster $k --no-headers -o custom-columns=L:.spec.forProvider.location)
+        e=$(kubectl get gkecluster $k --no-headers -o custom-columns=L:.status.atProvider.endpoint)
+        echo "Checking cluster (name=$k, location=$l, endpoint=$e) registration in argocd..."
+        lk="${l}_${k}"
+        argocd cluster get "https://$e" >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+          echo "cluster $lk with endpoint $e not registered in argocd, adding..."
+          rm -f /tmp/config
+          export KUBECONFIG=/tmp/config
+          gcloud container clusters get-credentials --region $l $k
+          argocd cluster add --name $lk $(kubectl config get-contexts --no-headers -o name)
+          rm -f /tmp/config
+          unset KUBECONFIG
+        else
+          echo "cluster $lk with endpoint $e already registered in argocd"
+        fi
+      done
+      sleep 30
+    done
